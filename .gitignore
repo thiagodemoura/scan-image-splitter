@@ -1,0 +1,6 @@
+/tiffsplit
+/tiffsplit.exe
+/photos/
+/debug/
+*.test
+/dist/
