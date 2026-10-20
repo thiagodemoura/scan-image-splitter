@@ -1,117 +1,273 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
-	"image"
-	"image/color"
-	"image/jpeg"
-	"image/png"
+	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
-	_ "golang.org/x/image/tiff"
-	"tiffsplit-agnostic/internal/segment"
+	"gocv.io/x/gocv"
+
+	"image-splitter/internal/detect"
+	"image-splitter/internal/imageio"
 )
 
 var (
 	inputDir, outputDir, debugDir string
-	recursive bool
-	threshold, minArea, minWidth, minHeight, padding, pdfDPI int
-	backgroundTolerance int
+	recursive, review             bool
+	padding, pdfDPI               int
+	fallbackDPI                   float64
+	cfg                           = detect.DefaultConfig()
+
+	stdout, stderr io.Writer = os.Stdout, os.Stderr
 )
 
 var splitCmd = &cobra.Command{
 	Use:   "split",
-	Short: "Segment scanned pages into photo crops",
-	Example: "  tiffsplit split -i ./scans -o ./photos\n  tiffsplit split -i ./scans -o ./photos --pdf-dpi 220 --debug-dir ./debug",
-	RunE: func(cmd *cobra.Command, args []string) error { return runSplit() },
+	Short: "Detect photos on scanned pages and export each one as a lossless TIFF",
+	Example: "  image-splitter split -i ./scans -o ./photos\n" +
+		"  image-splitter split -i ./scans -o ./photos --debug-dir ./debug\n" +
+		"  image-splitter split -i ./scans -o ./photos --threshold 20 --padding 0",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		stdout, stderr = cmd.OutOrStdout(), cmd.ErrOrStderr()
+		return runSplit()
+	},
 }
 
 func init() {
 	rootCmd.AddCommand(splitCmd)
 	f := splitCmd.Flags()
-	f.StringVarP(&inputDir, "input", "i", "", "Input folder containing .tif, .tiff, .jpg, .jpeg, and .pdf files (required)")
-	f.StringVarP(&outputDir, "output", "o", "", "Output folder for extracted JPEGs (required)")
-	f.BoolVarP(&recursive, "recursive", "r", true, "Recursively scan input folder")
-	f.IntVar(&threshold, "threshold", 35, "Foreground color-distance threshold (0-255); lower is more sensitive")
-	f.IntVar(&backgroundTolerance, "background-tolerance", 24, "Tolerance around estimated page background (0-255)")
-	f.IntVar(&minArea, "min-area", 12000, "Minimum detected region area in pixels")
-	f.IntVar(&minWidth, "min-width", 80, "Minimum crop width in pixels")
-	f.IntVar(&minHeight, "min-height", 80, "Minimum crop height in pixels")
-	f.IntVar(&padding, "padding", 8, "Padding around each crop in pixels")
-	f.IntVar(&pdfDPI, "pdf-dpi", 200, "DPI used to rasterize PDF pages (requires pdftoppm)")
-	f.StringVar(&debugDir, "debug-dir", "", "Optional folder for page previews and segmentation masks")
+	f.StringVarP(&inputDir, "input", "i", "", "Input folder with .tif, .tiff, .jpg, .jpeg, .png and .pdf scans (required)")
+	f.StringVarP(&outputDir, "output", "o", "", "Output folder for the extracted photos (required)")
+	f.BoolVarP(&recursive, "recursive", "r", true, "Scan subfolders")
+	f.BoolVar(&review, "review", true, "Write a review image per page with the numbered detections to <output>/review")
+	f.StringVar(&debugDir, "debug-dir", "", "Write segmentation masks and report.json to this folder")
+
+	f.Float64Var(&cfg.Threshold, "threshold", cfg.Threshold, "Colour distance from the scanner bed counted as photo (0-255); lower is more sensitive")
+	f.Float64Var(&cfg.MinArea, "min-area", cfg.MinArea, "Minimum photo area in page pixels")
+	f.Float64Var(&cfg.MinWidth, "min-width", cfg.MinWidth, "Minimum photo width in page pixels")
+	f.Float64Var(&cfg.MinHeight, "min-height", cfg.MinHeight, "Minimum photo height in page pixels")
+	f.Float64Var(&cfg.MaxPageFraction, "max-page-fraction", cfg.MaxPageFraction, "Reject regions covering more than this fraction of the page")
+	f.Float64Var(&cfg.MinFill, "min-fill", cfg.MinFill, "Reject regions filling less than this fraction of their rotated bounding box")
+	f.IntVar(&cfg.WorkSize, "work-size", cfg.WorkSize, "Long side in pixels of the downscaled image used for detection")
+	f.BoolVar(&cfg.Edges, "edges", cfg.Edges, "Use edge detection (finds photos with white borders)")
+	f.BoolVar(&cfg.SplitTouching, "split-touching", cfg.SplitTouching, "Try to separate photos that touch each other")
+	f.BoolVar(&cfg.Deskew, "deskew", cfg.Deskew, "Straighten rotated photos")
+	f.BoolVar(&cfg.Perspective, "perspective", cfg.Perspective, "Correct perspective when four reliable corners are found")
+	f.Float64Var(&cfg.MinAngle, "min-angle", cfg.MinAngle, "Rotations below this many degrees are cropped without resampling")
+
+	f.IntVar(&padding, "padding", 0, "Extra page pixels around each photo")
+	f.IntVar(&pdfDPI, "pdf-dpi", 600, "Resolution used to rasterize PDF pages (requires Poppler's pdftoppm)")
+	f.Float64Var(&fallbackDPI, "dpi", 0, "Resolution written to output TIFFs when the source records none (0 = leave unset)")
 	_ = splitCmd.MarkFlagRequired("input")
 	_ = splitCmd.MarkFlagRequired("output")
 }
 
+type pageReport struct {
+	File   string        `json:"file"`
+	Page   int           `json:"page"`
+	Width  int           `json:"width,omitempty"`
+	Height int           `json:"height,omitempty"`
+	DPI    float64       `json:"dpi,omitempty"`
+	Review string        `json:"review,omitempty"`
+	Stats  *detect.Stats `json:"stats,omitempty"`
+	Photos []photoReport `json:"photos"`
+	Error  string        `json:"error,omitempty"`
+}
+
+type photoReport struct {
+	detect.Detection
+	Output string `json:"output"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
 func runSplit() error {
-	if threshold < 0 || threshold > 255 || backgroundTolerance < 0 || backgroundTolerance > 255 {
-		return fmt.Errorf("threshold and background-tolerance must be between 0 and 255")
+	if cfg.Threshold <= 0 || cfg.Threshold > 255 {
+		return fmt.Errorf("threshold must be between 0 and 255")
 	}
-	if pdfDPI < 72 || pdfDPI > 600 { return fmt.Errorf("pdf-dpi must be between 72 and 600") }
-	info, err := os.Stat(inputDir); if err != nil { return fmt.Errorf("input: %w", err) }; if !info.IsDir() { return fmt.Errorf("input must be a directory") }
-	if err := os.MkdirAll(outputDir, 0755); err != nil { return err }
-	if debugDir != "" { if err := os.MkdirAll(debugDir, 0755); err != nil { return err } }
-
-	var files []string
-	walkErr := filepath.WalkDir(inputDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil { return err }; if d.IsDir() { if path != inputDir && !recursive { return filepath.SkipDir }; return nil }
-		ext := strings.ToLower(filepath.Ext(path)); if ext == ".tif" || ext == ".tiff" || ext == ".jpg" || ext == ".jpeg" || ext == ".pdf" { files = append(files, path) }; return nil
-	})
-	if walkErr != nil { return walkErr }; sort.Strings(files)
-	if len(files) == 0 { return fmt.Errorf("no TIFF, JPEG, or PDF files found in %s", inputDir) }
-
-	failed := 0
-	for _, path := range files {
-		fmt.Printf("Processing %s\n", path)
-		pages, cleanup, err := loadPages(path)
-		if err != nil { fmt.Fprintf(os.Stderr, "  ERROR: %v\n", err); failed++; continue }
-		for pageIndex, img := range pages {
-			base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-			pageLabel := fmt.Sprintf("%s_p%03d", safeName(base), pageIndex+1)
-			cfg := segment.Config{Threshold: threshold, BackgroundTolerance: backgroundTolerance, MinArea: minArea, MinWidth: minWidth, MinHeight: minHeight, Padding: padding}
-			regions, mask := segment.Find(img, cfg)
-			if debugDir != "" { _ = savePNG(filepath.Join(debugDir, pageLabel+"_mask.png"), mask) }
-			for i, r := range regions {
-				cropRect := r.Rect.Intersect(img.Bounds()); if cropRect.Empty() { continue }
-				crop := img.(interface{ SubImage(image.Rectangle) image.Image }).SubImage(cropRect)
-				out := filepath.Join(outputDir, fmt.Sprintf("%s_photo%03d.jpg", pageLabel, i+1))
-				if err := saveJPEG(out, crop); err != nil { fmt.Fprintf(os.Stderr, "  ERROR writing %s: %v\n", out, err); failed++; continue }
-				fmt.Printf("  -> %s (%dx%d)\n", out, cropRect.Dx(), cropRect.Dy())
+	if cfg.MaxPageFraction <= 0 || cfg.MaxPageFraction > 1 || cfg.MinFill < 0 || cfg.MinFill > 1 {
+		return fmt.Errorf("max-page-fraction and min-fill must be between 0 and 1")
+	}
+	if pdfDPI < 72 || pdfDPI > 1200 {
+		return fmt.Errorf("pdf-dpi must be between 72 and 1200")
+	}
+	if padding < 0 {
+		return fmt.Errorf("padding must not be negative")
+	}
+	info, err := os.Stat(inputDir)
+	if err != nil {
+		return fmt.Errorf("input: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("input must be a directory")
+	}
+	reviewDir := filepath.Join(outputDir, "review")
+	dirs := []string{outputDir, debugDir}
+	if review {
+		dirs = append(dirs, reviewDir)
+	}
+	for _, dir := range dirs {
+		if dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return err
 			}
-			if len(regions) == 0 { fmt.Printf("  No regions detected on page %d\n", pageIndex+1) }
 		}
-		cleanup()
 	}
-	if failed > 0 { return fmt.Errorf("finished with %d file or output error(s)", failed) }
+
+	files, err := findInputs()
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no TIFF, JPEG, PNG or PDF files found in %s", inputDir)
+	}
+
+	var reports []pageReport
+	failed, exported := 0, 0
+	for _, path := range files {
+		fmt.Fprintf(stdout, "Processing %s\n", path)
+		base := safeName(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+		for page, err := range imageio.Pages(path, pdfDPI) {
+			if err != nil {
+				fmt.Fprintf(stderr, "  ERROR: %v\n", err)
+				reports = append(reports, pageReport{File: path, Page: page.Number, Error: err.Error()})
+				failed++
+				continue
+			}
+			rep := processPage(page, path, fmt.Sprintf("%s_p%03d", base, page.Number), reviewDir)
+			page.Mat.Close()
+			if rep.Error != "" {
+				failed++
+			}
+			exported += len(rep.Photos)
+			reports = append(reports, rep)
+		}
+	}
+
+	if debugDir != "" {
+		data, err := json.MarshalIndent(reports, "", "  ")
+		if err == nil {
+			err = os.WriteFile(filepath.Join(debugDir, "report.json"), data, 0o644)
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "ERROR writing report: %v\n", err)
+			failed++
+		}
+	}
+	fmt.Fprintf(stdout, "Exported %d photo(s) from %d file(s)\n", exported, len(files))
+	if failed > 0 {
+		return fmt.Errorf("finished with %d error(s)", failed)
+	}
 	return nil
 }
 
-// JPEG and TIFF are decoded by Go's image decoders. PDFs use Poppler's pdftoppm.
-func loadPages(path string) ([]image.Image, func(), error) {
-	if strings.EqualFold(filepath.Ext(path), ".pdf") {
-		if _, err := exec.LookPath("pdftoppm"); err != nil { return nil, func(){}, fmt.Errorf("PDF input requires Poppler pdftoppm in PATH; see README") }
-		tmp, err := os.MkdirTemp("", "tiffsplit-pdf-*"); if err != nil { return nil, func(){}, err }
-		prefix := filepath.Join(tmp, "page")
-		cmd := exec.Command("pdftoppm", "-r", fmt.Sprint(pdfDPI), "-jpeg", path, prefix)
-		if output, err := cmd.CombinedOutput(); err != nil { os.RemoveAll(tmp); return nil, func(){}, fmt.Errorf("pdftoppm: %w: %s", err, strings.TrimSpace(string(output))) }
-		entries, err := os.ReadDir(tmp); if err != nil { os.RemoveAll(tmp); return nil, func(){}, err }
-		var names []string; for _, e := range entries { if strings.HasSuffix(strings.ToLower(e.Name()), ".jpg") || strings.HasSuffix(strings.ToLower(e.Name()), ".jpeg") { names = append(names, filepath.Join(tmp, e.Name())) } }; sort.Strings(names)
-		pages := make([]image.Image, 0, len(names)); for _, name := range names { f, e := os.Open(name); if e != nil { os.RemoveAll(tmp); return nil, func(){}, e }; im, _, e := image.Decode(f); f.Close(); if e != nil { os.RemoveAll(tmp); return nil, func(){}, e }; pages = append(pages, im) }
-		return pages, func(){ _ = os.RemoveAll(tmp) }, nil
+func processPage(page imageio.Page, path, label, reviewDir string) pageReport {
+	rep := pageReport{File: path, Page: page.Number, Width: page.Mat.Cols(), Height: page.Mat.Rows(), DPI: page.DPI, Photos: []photoReport{}}
+	dpi := page.DPI
+	if dpi == 0 {
+		dpi = fallbackDPI
 	}
-	f, err := os.Open(path); if err != nil { return nil, func(){}, err }; defer f.Close()
-	img, _, err := image.Decode(f); if err != nil { return nil, func(){}, fmt.Errorf("decode image: %w", err) }
-	return []image.Image{img}, func(){}, nil
+
+	res, err := detect.Detect(page.Mat, cfg, debugDir != "")
+	if err != nil {
+		fmt.Fprintf(stderr, "  ERROR page %d: %v\n", page.Number, err)
+		rep.Error = err.Error()
+		return rep
+	}
+	defer res.Close()
+	rep.Stats = &res.Stats
+
+	for name, m := range res.Masks {
+		if err := imageio.WritePNG(filepath.Join(debugDir, fmt.Sprintf("%s_mask_%s.png", label, name)), m); err != nil {
+			fmt.Fprintf(stderr, "  ERROR writing mask: %v\n", err)
+		}
+	}
+
+	var errs []string
+	for _, d := range res.Detections {
+		out := filepath.Join(outputDir, fmt.Sprintf("%s_photo%02d.tif", label, d.Index))
+		crop, err := detect.Extract(page.Mat, d, padding)
+		if err == nil {
+			err = imageio.WriteTIFF(out, crop, dpi)
+			rep.Photos = append(rep.Photos, photoReport{Detection: d, Output: out, Width: crop.Cols(), Height: crop.Rows()})
+			crop.Close()
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "  ERROR writing %s: %v\n", out, err)
+			errs = append(errs, err.Error())
+			continue
+		}
+		fmt.Fprintf(stdout, "  -> %s (%s, %.1f°)\n", out, d.Method, d.Angle)
+	}
+	if len(res.Detections) == 0 {
+		fmt.Fprintf(stdout, "  No photos detected on page %d\n", page.Number)
+	}
+
+	if review {
+		rep.Review = filepath.Join(reviewDir, label+".jpg")
+		if err := writeReview(rep.Review, page.Mat, res.Detections); err != nil {
+			fmt.Fprintf(stderr, "  ERROR writing review: %v\n", err)
+			errs = append(errs, err.Error())
+		}
+	}
+	rep.Error = strings.Join(errs, "; ")
+	return rep
 }
 
-func saveJPEG(path string, img image.Image) error { f, err := os.Create(path); if err != nil { return err }; defer f.Close(); return jpeg.Encode(f, img, &jpeg.Options{Quality: 94}) }
-func savePNG(path string, img image.Image) error { f, err := os.Create(path); if err != nil { return err }; defer f.Close(); return png.Encode(f, img) }
-func safeName(s string) string { s = strings.Map(func(r rune) rune { if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' { return r }; return '_' }, s); if s == "" { return "scan" }; return s }
-var _ color.Color
+func writeReview(path string, page gocv.Mat, ds []detect.Detection) error {
+	img, err := detect.Review(page, ds, 2000)
+	if err != nil {
+		return err
+	}
+	defer img.Close()
+	return imageio.WriteJPEG(path, img, 90)
+}
+
+func findInputs() ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(inputDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path != inputDir && (!recursive || samePath(path, outputDir) || samePath(path, debugDir)) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if imageio.Supported(path) {
+			files = append(files, path)
+		}
+		return nil
+	})
+	sort.Strings(files)
+	return files, err
+}
+
+func samePath(a, b string) bool {
+	if b == "" {
+		return false
+	}
+	pa, err1 := filepath.Abs(a)
+	pb, err2 := filepath.Abs(b)
+	return err1 == nil && err2 == nil && strings.EqualFold(pa, pb)
+}
+
+func safeName(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, s)
+	if s == "" {
+		return "scan"
+	}
+	return s
+}

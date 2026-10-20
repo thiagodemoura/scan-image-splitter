@@ -8,9 +8,11 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "tiffsplit",
+	Use:   "image-splitter",
 	Short: "Find and export individual photographs from TIFF, JPEG, and PDF scans",
-	Long:  "A format-agnostic scan processor. JPEG and TIFF are decoded in Go; PDF pages are rasterized using Poppler's pdftoppm command.",
+	Long: "Detects photos placed freely on scanned pages (TIFF, including multi-page, JPEG, PNG and PDF), " +
+		"straightens them and exports each one as a lossless LZW-compressed TIFF. Uses OpenCV via GoCV; " +
+		"PDF pages are rasterized with Poppler's pdftoppm.",
 }
 
 func Execute() {

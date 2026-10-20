@@ -1,5 +1,5 @@
-/tiffsplit
-/tiffsplit.exe
+﻿/image-splitter
+/image-splitter.exe
 /photos/
 /debug/
 *.test

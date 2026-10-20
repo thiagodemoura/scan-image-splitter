@@ -1,5 +1,5 @@
 package main
 
-import "tiffsplit-agnostic/cmd"
+import "image-splitter/cmd"
 
 func main() { cmd.Execute() }
